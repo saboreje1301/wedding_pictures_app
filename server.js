@@ -35,20 +35,35 @@ let oAuth2Client = null;
 try {
   const credentialsPath = process.env.GOOGLE_CREDENTIALS_PATH || "credentials.json";
   const resolved = path.resolve(process.cwd(), credentialsPath);
-  console.log(`🔎 Buscando credentials en: ${resolved}`);
-  if (!fs.existsSync(resolved)) throw new Error(`${resolved} no encontrado`);
-  const raw = fs.readFileSync(resolved, { encoding: 'utf8' });
-  const credentials = JSON.parse(raw);
 
-  // Algunas descargas de Google usan 'installed' o 'web'
+  let credentials = null;
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    console.log('🔎 Cargando credenciales desde variable de entorno GOOGLE_CREDENTIALS_JSON');
+    try {
+      credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+    } catch (e) {
+      throw new Error('GOOGLE_CREDENTIALS_JSON no es JSON válido: ' + e.message);
+    }
+  } else if (fs.existsSync(resolved)) {
+    console.log(`🔎 Buscando credentials en: ${resolved}`);
+    const raw = fs.readFileSync(resolved, { encoding: 'utf8' });
+    credentials = JSON.parse(raw);
+  } else if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    console.log('🔎 Construyendo credenciales desde GOOGLE_CLIENT_* variables de entorno');
+    const redirects = (process.env.GOOGLE_REDIRECT_URIS || '').split(',').map(s => s.trim()).filter(Boolean);
+    credentials = { web: { client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, redirect_uris: redirects } };
+  } else {
+    throw new Error(`${resolved} no encontrado y variables de entorno de credenciales no proporcionadas`);
+  }
+
   const conf = credentials.installed || credentials.web || credentials;
   const { client_secret, client_id, redirect_uris } = conf;
-  if (!client_id || !client_secret || !redirect_uris) throw new Error('credentials.json inválido (falta client_id/client_secret/redirect_uris)');
+  if (!client_id || !client_secret || !redirect_uris || !redirect_uris.length) throw new Error('Credenciales inválidas (falta client_id/client_secret/redirect_uris)');
 
   oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-  console.log('✅ credentials.json cargado correctamente');
+  console.log('✅ Credenciales cargadas correctamente');
 } catch (err) {
-  console.warn("⚠️ No se pudo cargar credentials.json. Rutas de autenticación estarán limitadas.\n", err && err.message ? err.message : err);
+  console.warn("⚠️ No se pudo cargar credenciales de Google. Rutas de autenticación estarán limitadas.\n", err && err.message ? err.message : err);
 }
 
 // === Intentar cargar token existente ===
@@ -63,14 +78,11 @@ if (oAuth2Client && fs.existsSync("token.json")) {
 } else if (oAuth2Client) {
   console.log("⚠️ No se encontró token.json. Autentícate en /auth una vez.");
 } else {
-  console.log("⚠️ OAuth no configurado. Coloca un credentials.json para habilitar Google Drive.");
+  console.log("⚠️ OAuth no configurado. Coloca un credentials.json o variables de entorno para habilitar Google Drive.");
 }
-
 // === Ruta para iniciar autenticación manual (solo tú la usas) ===
 app.get("/auth", (req, res) => {
   if (!oAuth2Client) return res.status(500).send("credentials.json no configurado en el servidor");
-  // Forzar selector de cuenta para permitir cambiar sesión en la pantalla de Google
-  // Si pasas ?force=1 usaremos prompt 'consent select_account' para forzar selector + consentimiento
   const shouldForce = String(req.query.force || '') === '1';
   const promptValue = req.query.prompt || (shouldForce ? 'consent select_account' : 'select_account');
 
@@ -80,9 +92,7 @@ app.get("/auth", (req, res) => {
     prompt: promptValue,
     include_granted_scopes: true,
   };
-  // Opcional: aceptar login_hint como query param para sugerir cuenta
   if (req.query.login_hint) opts.login_hint = req.query.login_hint;
-  // Opcional: aceptar authuser para forzar índice de cuenta
   if (req.query.authuser) opts.authuser = req.query.authuser;
   const authUrl = oAuth2Client.generateAuthUrl(opts);
   console.log('🔗 URL de autorización generada:', authUrl);
