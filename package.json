@@ -20,10 +20,11 @@
   },
   "homepage": "https://github.com/saboreje1301/wedding_pictures_app#readme",
   "dependencies": {
+    "busboy": "^1.6.0",
+    "cloudinary": "^2.8.0",
     "cors": "^2.8.5",
     "dotenv": "^16.1.4",
     "express": "^5.1.0",
-    "googleapis": "^165.0.0",
     "multer": "^2.0.2"
   }
 }

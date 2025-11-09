@@ -39,30 +39,9 @@
             </div>
         </section>
 </header>
-        <div id="configNotice" class="bg-yellow-50 border-2 border-yellow-400 rounded-xl p-5 mb-6">
-            <h3 class="font-bold text-yellow-800 mb-2">⚙️ Configuración Requerida</h3>
-            <ol class="list-decimal list-inside text-yellow-700 text-sm space-y-1">
-                <li>Obtén Client ID y API Key de Google Cloud Console</li>
-                <li>Reemplázalos en el código (busca CONFIG al inicio del script)</li>
-                <li>Recarga la página</li>
-            </ol>
-        </div>
+        <!-- La autenticación ya no es necesaria: las subidas se envían al backend que usa Cloudinary -->
 
-        <div id="authSection" class="bg-white rounded-2xl shadow-xl p-8 text-center">
-            <p class="text-gray-700 mb-6">Conecta con Google Drive para subir tus fotos</p>
-            <button id="loginBtn" 
-                    class="inline-flex items-center gap-3 px-8 py-3 bg-white border-2 border-gray-300 rounded-lg font-semibold hover:border-blue-500 hover:bg-gray-50 transition-all">
-                <svg width="20" height="20" viewBox="0 0 24 24">
-                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-                </svg>
-                Conectar con Google Drive
-            </button>
-        </div>
-
-        <div id="uploadSection" class="bg-white rounded-2xl shadow-xl p-8 hidden">
+    <div id="uploadSection" class="bg-white rounded-2xl shadow-xl p-8">
             <div class="mb-6">
                 <label for="guestName" class="flex items-center text-gray-700 font-semibold mb-2">
                     <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -125,19 +104,32 @@
             ? META_BACKEND.content.trim().replace(/\/$/, '')
             : '';
 
-        async function uploadToBackend(file, guestName) {
-            const formData = new FormData();
-            formData.append("file", file);
-            formData.append("guestName", guestName);
-            const url = API_BASE ? `${API_BASE}/upload` : `/upload`;
-            const res = await fetch(url, {
-                method: "POST",
-                body: formData
-            });
-            // lanzar si status no OK para que el caller entre en catch
+        // Subida firmada a Cloudinary usando una Netlify Function
+        async function uploadToCloudinary(file, guestName) {
+            // pedir firma al servidor (Netlify Function)
+            const signUrl = `/.netlify/functions/sign?guestName=${encodeURIComponent(guestName)}`;
+            const signRes = await fetch(signUrl);
+            if (!signRes.ok) {
+                const txt = await signRes.text().catch(() => signRes.statusText || 'error');
+                throw new Error('No se pudo obtener la firma: ' + (txt || signRes.status));
+            }
+            const sign = await signRes.json();
+            if (sign.error) throw new Error(sign.error || 'Firma inválida');
+
+            const { api_key, timestamp, signature, cloud_name, folder } = sign;
+            const url = `https://api.cloudinary.com/v1_1/${cloud_name}/auto/upload`;
+
+            const fd = new FormData();
+            fd.append('file', file);
+            fd.append('api_key', api_key);
+            fd.append('timestamp', timestamp);
+            fd.append('signature', signature);
+            fd.append('folder', folder);
+
+            const res = await fetch(url, { method: 'POST', body: fd });
             if (!res.ok) {
                 const txt = await res.text().catch(() => res.statusText || 'error');
-                throw new Error(txt || `HTTP ${res.status}`);
+                throw new Error('Cloudinary upload failed: ' + (txt || res.status));
             }
             return await res.json();
         }
@@ -176,9 +168,8 @@
             },
 
             showUploadSection(show) {
-                document.getElementById('authSection').classList.toggle('hidden', show);
+                // Mantener API: mostrar/ocultar la sección de subida
                 document.getElementById('uploadSection').classList.toggle('hidden', !show);
-                document.getElementById('configNotice').classList.toggle('hidden', show);
             }
         };
 
@@ -196,20 +187,14 @@
             uploadBtn: document.getElementById('uploadBtn'),
             previewSection: document.getElementById('previewSection'),
             previewGrid: document.getElementById('previewGrid'),
-            fileCount: document.getElementById('fileCount'),
-            loginBtn: document.getElementById('loginBtn')
+            fileCount: document.getElementById('fileCount')
         };
 
 
         // =====================================================
         // EVENTS
         // =====================================================
-        els.loginBtn.addEventListener('click', () => {
-            // Simulamos login y mostramos la sección de subida
-            UI.showUploadSection(true);
-            UI.showStatus('Conexión simulada con Google Drive. Ya puedes subir archivos.', 'success');
-        });
-
+        // La página ya muestra la sección de subida por defecto.
         els.fileInput.addEventListener('change', (e) => {
             const files = Array.from(e.target.files || []);
             // Añadir archivos nuevos y crear object URLs
@@ -236,13 +221,14 @@
             for (const item of state.selectedFiles) {
                 try {
                     UI.showStatus(`Subiendo ${item.file.name}...`, 'info');
-                    const res = await uploadToBackend(item.file, els.guestName.value.trim());
-                    // Se asume que la API responde { ok: true } u objeto similar
-                    if (res && (res.ok === false || res.error)) {
+                    const res = await uploadToCloudinary(item.file, els.guestName.value.trim());
+                    // Cloudinary responde con secure_url en caso de éxito
+                    if (res && (res.error || !res.secure_url)) {
                         allSuccess = false;
                         UI.showStatus(`Error subiendo ${item.file.name}: ${res.error || 'respuesta no OK'}`, 'error');
                     } else {
-                        UI.showStatus(`Archivo ${item.file.name} subido correctamente.`, 'success');
+                        const url = res.secure_url || (res.url || '');
+                        UI.showStatus(`Archivo ${item.file.name} subido: <a href="${url}" target="_blank" class="underline text-sm">Ver archivo</a>`, 'success');
                     }
                 } catch (err) {
                     allSuccess = false;

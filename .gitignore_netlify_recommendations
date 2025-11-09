@@ -1,0 +1,5 @@
+/.env
+upload_errors.log
+token.json
+node_modules/
+.env.local

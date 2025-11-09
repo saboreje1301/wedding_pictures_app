@@ -1,207 +1,137 @@
-import express from "express";
-import multer from "multer";
-import cors from "cors";
-import fs from "fs";
-import { google } from "googleapis";
+import express from 'express';
+import multer from 'multer';
+import cors from 'cors';
+import fs from 'fs';
 import path from 'path';
 import url from 'url';
+// ya no usamos Google Drive; usaremos Cloudinary
+import { v2 as cloudinary } from 'cloudinary';
+import dotenv from 'dotenv';
 
+// Cargar .env si existe
+dotenv.config();
+
+const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const app = express();
-const UPLOAD_DIR = "uploads";
-// Asegurarnos de que exista la carpeta de uploads
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
-const upload = multer({ dest: `${UPLOAD_DIR}/` });
+const UPLOAD_DIR = 'uploads';
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// Límite por archivo (MB) configurable vía env, default 50MB
+const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '50', 10);
+const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
+const upload = multer({ dest: `${UPLOAD_DIR}/`, limits: { fileSize: MAX_FILE_SIZE } });
 const PORT = process.env.PORT || 3000;
 
-// === Middlewares ===
-app.use(cors());
+// CORS
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN && process.env.FRONTEND_ORIGIN.trim();
+if (FRONTEND_ORIGIN) {
+  console.log(`🔒 Restringiendo CORS a: ${FRONTEND_ORIGIN}`);
+  app.use(cors({ origin: FRONTEND_ORIGIN }));
+} else {
+  app.use(cors());
+}
 app.use(express.json());
 
-// Resolver __dirname en ESM
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-
-// Servir archivos estáticos (index.html, hero.png, etc.) desde la raíz del proyecto
+// servir estáticos
 app.use(express.static(path.join(__dirname)));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-// Ruta raíz — enviar index.html
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+// health
+app.get('/health', (req, res) => res.json({ ok: true, env: { frontend: FRONTEND_ORIGIN || null } }));
+
+// Configurar Cloudinary desde variables de entorno
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// === Configurar Google OAuth ===
-let oAuth2Client = null;
-try {
-  const credentialsPath = process.env.GOOGLE_CREDENTIALS_PATH || "credentials.json";
-  const resolved = path.resolve(process.cwd(), credentialsPath);
-
-  let credentials = null;
-  if (process.env.GOOGLE_CREDENTIALS_JSON) {
-    console.log('🔎 Cargando credenciales desde variable de entorno GOOGLE_CREDENTIALS_JSON');
-    try {
-      credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-    } catch (e) {
-      throw new Error('GOOGLE_CREDENTIALS_JSON no es JSON válido: ' + e.message);
-    }
-  } else if (fs.existsSync(resolved)) {
-    console.log(`🔎 Buscando credentials en: ${resolved}`);
-    const raw = fs.readFileSync(resolved, { encoding: 'utf8' });
-    credentials = JSON.parse(raw);
-  } else if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
-    console.log('🔎 Construyendo credenciales desde GOOGLE_CLIENT_* variables de entorno');
-    const redirects = (process.env.GOOGLE_REDIRECT_URIS || '').split(',').map(s => s.trim()).filter(Boolean);
-    credentials = { web: { client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, redirect_uris: redirects } };
-  } else {
-    throw new Error(`${resolved} no encontrado y variables de entorno de credenciales no proporcionadas`);
-  }
-
-  const conf = credentials.installed || credentials.web || credentials;
-  const { client_secret, client_id, redirect_uris } = conf;
-  if (!client_id || !client_secret || !redirect_uris || !redirect_uris.length) throw new Error('Credenciales inválidas (falta client_id/client_secret/redirect_uris)');
-
-  oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-  console.log('✅ Credenciales cargadas correctamente');
-} catch (err) {
-  console.warn("⚠️ No se pudo cargar credenciales de Google. Rutas de autenticación estarán limitadas.\n", err && err.message ? err.message : err);
+// Comprobar configuración mínima (no imprimir valores sensibles)
+if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+  console.warn('⚠️ Cloudinary no está completamente configurado. Revisa las variables de entorno CLOUDINARY_*');
 }
 
-// === Intentar cargar token existente ===
-if (oAuth2Client && fs.existsSync("token.json")) {
+// Nota: ya no usamos Google Drive ni OAuth; el upload va directo a Cloudinary
+
+// upload
+app.post('/upload', upload.single('file'), async (req, res) => {
+  const guestName = req.body.guestName || '';
+  if (!guestName) return res.status(400).json({ error: 'guestName faltante' });
+  if (!req.file) return res.status(400).json({ error: 'Archivo faltante' });
+
+  const tempPath = req.file.path;
   try {
-    const token = JSON.parse(fs.readFileSync("token.json"));
-    oAuth2Client.setCredentials(token);
-    console.log("✅ Token de acceso cargado");
-  } catch (err) {
-    console.warn("⚠️ Error cargando token.json:", err.message);
-  }
-} else if (oAuth2Client) {
-  console.log("⚠️ No se encontró token.json. Autentícate en /auth una vez.");
-} else {
-  console.log("⚠️ OAuth no configurado. Coloca un credentials.json o variables de entorno para habilitar Google Drive.");
-}
-// === Ruta para iniciar autenticación manual (solo tú la usas) ===
-app.get("/auth", (req, res) => {
-  if (!oAuth2Client) return res.status(500).send("credentials.json no configurado en el servidor");
-  const shouldForce = String(req.query.force || '') === '1';
-  const promptValue = req.query.prompt || (shouldForce ? 'consent select_account' : 'select_account');
+    const mainFolder = process.env.CLOUDINARY_FOLDER || 'wedding_photos';
+    const sanitized = guestName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const uploadFolder = `${mainFolder}/${sanitized}`;
 
-  const opts = {
-    access_type: "offline",
-    scope: ["https://www.googleapis.com/auth/drive.file"],
-    prompt: promptValue,
-    include_granted_scopes: true,
-  };
-  if (req.query.login_hint) opts.login_hint = req.query.login_hint;
-  if (req.query.authuser) opts.authuser = req.query.authuser;
-  const authUrl = oAuth2Client.generateAuthUrl(opts);
-  console.log('🔗 URL de autorización generada:', authUrl);
-  res.redirect(authUrl);
-});
-
-// === Callback que guarda el token ===
-app.get("/oauth2callback", async (req, res) => {
-  const { code } = req.query;
-  try {
-    if (!oAuth2Client) return res.status(500).send("OAuth no configurado. No hay credentials.json");
-    if (!code) return res.status(400).send("Código de autorización faltante");
-    const { tokens } = await oAuth2Client.getToken(code);
-    oAuth2Client.setCredentials(tokens);
-    fs.writeFileSync("token.json", JSON.stringify(tokens));
-    res.send("✅ Autenticación completada. Puedes cerrar esta pestaña.");
-  } catch (error) {
-    console.error(error);
-    res.status(500).send("❌ Error al autenticar");
-  }
-});
-
-// === Subida de archivos ===
-app.post("/upload", upload.single("file"), async (req, res) => {
-  if (!oAuth2Client) return res.status(500).json({ error: "OAuth no configurado en el servidor" });
-  let tempPath;
-  try {
-    const { guestName } = req.body;
-    if (!guestName) return res.status(400).json({ error: "guestName faltante" });
-    if (!req.file) return res.status(400).json({ error: "Archivo faltante" });
-
-    tempPath = req.file.path;
-
-    const drive = google.drive({ version: "v3", auth: oAuth2Client });
-
-    // Buscar o crear carpeta principal
-    const mainFolder = "Fotos_Boda";
-    const folderRes = await drive.files.list({
-      q: `name='${mainFolder}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      fields: "files(id)",
+    const result = await cloudinary.uploader.upload(tempPath, {
+      folder: uploadFolder,
+      resource_type: 'auto',
+      use_filename: true,
+      unique_filename: false,
+      overwrite: false,
     });
 
-    let folderId = folderRes.data.files.length
-      ? folderRes.data.files[0].id
-      : (
-          await drive.files.create({
-            resource: {
-              name: mainFolder,
-              mimeType: "application/vnd.google-apps.folder",
-            },
-            fields: "id",
-          })
-        ).data.id;
-
-    // Subcarpeta por invitado
-    const sanitizedName = guestName.replace(/[^a-zA-Z0-9]/g, "_");
-    const guestFolderRes = await drive.files.list({
-      q: `name='${sanitizedName}' and '${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      fields: "files(id)",
-    });
-
-    const guestFolderId = guestFolderRes.data.files.length
-      ? guestFolderRes.data.files[0].id
-      : (
-          await drive.files.create({
-            resource: {
-              name: sanitizedName,
-              mimeType: "application/vnd.google-apps.folder",
-              parents: [folderId],
-            },
-            fields: "id",
-          })
-        ).data.id;
-
-    // Subir archivo
-    const fileMetadata = {
-      name: `${Date.now()}_${req.file.originalname}`,
-      parents: [guestFolderId],
-    };
-    const media = {
-      mimeType: req.file.mimetype,
-      body: fs.createReadStream(req.file.path),
-    };
-
-    const result = await drive.files.create({
-      resource: fileMetadata,
-      media,
-      fields: "id, name, webViewLink",
-    });
-
-    // eliminar temporal
-    if (tempPath && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-
-    res.json({
-      success: true,
-      file: result.data,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    // intentar limpiar temporal en caso de error
+    // cleanup temp
     if (tempPath && fs.existsSync(tempPath)) {
       try { fs.unlinkSync(tempPath); } catch (e) { /* ignore */ }
     }
+
+    // Responder con campos seguros (no reenviamos el objeto raw completo)
+    res.json({ success: true, file: { public_id: result.public_id, url: result.secure_url } });
+  } catch (err) {
+    // Generar un id corto para correlación y no filtrar el mensaje original al cliente
+    const errorId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+
+    // función para redacción de secretos en mensajes
+    const redact = (s) => {
+      if (!s) return s;
+      let out = String(s);
+      try {
+        if (process.env.CLOUDINARY_API_KEY) {
+          out = out.split(process.env.CLOUDINARY_API_KEY).join('[REDACTED_API_KEY]');
+        }
+      } catch (e) { /* ignore */ }
+      return out;
+    };
+
+    // construir entrada de log (sin secretos)
+    const logPath = path.join(__dirname, 'upload_errors.log');
+    const logEntry = {
+      id: errorId,
+      ts: new Date().toISOString(),
+      guestName: req.body && req.body.guestName ? String(req.body.guestName) : null,
+      originalName: req.file && req.file.originalname ? String(req.file.originalname) : null,
+      message: redact(err && err.message ? err.message : String(err)),
+      stack: redact(err && err.stack ? err.stack : null)
+    };
+
+    try {
+      fs.appendFileSync(logPath, JSON.stringify(logEntry) + '\n');
+    } catch (e) {
+      console.error('No se pudo escribir upload_errors.log:', e && e.message ? e.message : e);
+    }
+
+    // log seguro en consola (mensaje redacted)
+    console.error(`Cloudinary upload error [id=${errorId}]:`, logEntry.message);
+
+    if (tempPath && fs.existsSync(tempPath)) { try { fs.unlinkSync(tempPath); } catch (e) {} }
+    // Respuesta genérica al cliente (evita filtrar claves/errores sensibles)
+    res.status(500).json({ success: false, error: 'Error al subir el archivo. Contacta al administrador con el id: ' + errorId, id: errorId });
   }
 });
 
-// === Iniciar servidor ===
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
+// Manejo de errores de multer (p. ej. límite de tamaño)
+app.use((err, req, res, next) => {
+  if (err && err.name === 'MulterError') {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ success: false, error: `Archivo demasiado grande. Tamaño máximo por archivo: ${MAX_FILE_SIZE_MB} MB` });
+    }
+    return res.status(400).json({ success: false, error: 'Error en la carga del archivo: ' + err.message });
+  }
+  return next(err);
 });
+
+// start
+app.listen(PORT, () => console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`));
+
